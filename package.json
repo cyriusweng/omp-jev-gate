@@ -1,0 +1,36 @@
+{
+  "name": "@cyriusweng/omp-jev-gate",
+  "version": "0.1.0",
+  "description": "TypeSafe Jev preflight and typed judgment checkpoints for OMP conversations",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cyriusweng/omp-jev-gate.git"
+  },
+  "keywords": [
+    "omp",
+    "oh-my-pi",
+    "extension",
+    "typesafe",
+    "jev",
+    "judgment"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "for file in src/*.mjs test/*.mjs; do node --check \"$file\" || exit; done"
+  },
+  "engines": {
+    "node": ">=22.15"
+  },
+  "omp": {
+    "extensions": [
+      "./src/index.mjs"
+    ]
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ]
+}
