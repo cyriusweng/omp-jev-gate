@@ -52,6 +52,7 @@ export function normalizePreflight(answers = {}) {
   for (const [id, question] of Object.entries(PREFLIGHT_QUESTIONS)) validateAnswer(question, answers[id]);
   return {
     decisionMode: answers.decision_mode.choice,
+    decisionModeConfidence: answers.decision_mode.confidence,
     reasoningDepth: answers.reasoning_depth.score,
     verificationDepth: answers.verification_depth.choice,
     additionalJevProbability: answers.additional_jev.bool,
@@ -59,20 +60,23 @@ export function normalizePreflight(answers = {}) {
 }
 
 export function formatPolicy(receipt) {
-  const guidance = receipt.signals ? [
-    `- Decision mode: ${receipt.signals.decisionMode}.`,
-    `- Reasoning depth: ${receipt.signals.reasoningDepth}.`,
-    `- Verification depth: ${receipt.signals.verificationDepth}.`,
-    `- Additional Jev checkpoint probability: ${receipt.signals.additionalJevProbability}.`,
-  ] : [`- Preflight unavailable: ${receipt.fallbackReason}; continue with current-agent reasoning under the configured fallback.`];
+  const signals = receipt.signals ? [
+    `- Entry signals for this prompt. Decision mode: ${receipt.signals.decisionMode} (confidence ${receipt.signals.decisionModeConfidence}). Reasoning depth: ${receipt.signals.reasoningDepth}. Verification depth: ${receipt.signals.verificationDepth}. Additional Jev checkpoint probability: ${receipt.signals.additionalJevProbability}.`,
+  ] : [`- Preflight unavailable: ${receipt.fallbackReason}. Record the degraded observation and continue with current-agent reasoning; explicit jev-judge calls follow the configured fallback.`];
   return [
-    'Jev judgment policy for this prompt:',
-    `- Preflight backend: ${receipt.backend}${receipt.model ? ` (${receipt.model})` : ''}.`,
-    ...guidance,
-    '- Use Jev for one evidence-based bounded question at a time: classification, candidate selection, rubric scoring or a boolean condition.',
-    '- Split multi-factor design and risk questions into atomic checks; combine their results using explicit reasoning and rules.',
-    '- Enforce mode checks for a completed checkpoint before the first edit, write or bash call. Choice and score checkpoints require confidence of at least 0.5; boolean checkpoints record the supplied probability.',
-    '- Service failures follow the configured continue or block policy. User authorisation and OMP tool permissions govern each action.',
+    `Jev judgment policy (global; applies to every task domain in this conversation). Active mode: ${receipt.mode}.`,
+    `- Preflight backend: ${receipt.backend}${receipt.model ? ` (${receipt.model})` : ''}. Preflight supplies entry signals and, in enforce mode, may set the initial direct disposition; discover actual checkpoints from the full session history and newly gathered evidence.`,
+    receipt.mode === 'guide'
+      ? '- Guide is advisory: the policy teaches checkpoint selection while edit, write and bash stay free.'
+      : '- Enforce decides the first edit, write or bash call from the turn disposition: a direct preflight disposition or a completed checkpoint allows it.',
+    ...signals,
+    '- Call jev-judge when all four hold: the step is a selection, scoring or evidence-sufficiency judgment; the question fits choice, bool or score; the gathered evidence forms a clear state; and the answer would materially change the path, scope, risk handling, verification depth or delivery conclusion.',
+    '- Direct paths stay direct: exact facts come from files, code and sources; numbers come from computation and tests; user-owned scope, cost and permission choices go to the user; a settled plan continues while its evidence holds. For open-ended work, form candidates first and judge when a material choice emerges.',
+    '- Ask one bounded question at a time over the relevant evidence; batch independent questions that share one state. Split multi-factor decisions into atomic checks and combine the results with explicit reasoning.',
+    '- Read answers by kind: choice selects the strongest-supported candidate pending fact and permission checks; score places the property on ordered levels applied per project rules; a bool probability measures support for the statement, so low support on an evidence-sufficiency question calls for more evidence before the dependent action.',
+    '- Start a fresh checkpoint when new evidence changes the candidates, a failure opens a retry path or the user changes scope; an unchanged object, plan and evidence may reuse a completed checkpoint.',
+    '- Choice and score checkpoints require confidence of at least 0.5; boolean checkpoints record the probability.',
+    '- Explicit jev-judge calls follow the configured continue or block fallback in every mode; automatic preflight TypeSafe failures continue in guide and follow the fallback in enforce; cancellation propagates. User authorisation and OMP tool permissions govern each action.',
     '- Internal reasoning, later choices and calls through other tool names remain subject to the agent checkpoint policy.',
   ].join('\n');
 }
@@ -124,13 +128,14 @@ export function installJevGate(pi, { client, configPath = CONFIG_PATH } = {}) {
       outcome = {
         backend: response.backend, model: response.model, usage: response.usage,
         signals: normalizePreflight(response.answers),
-        action: config.mode === 'enforce' ? 'policy_injected' : 'observed'
+        action: config.mode === 'observe' ? 'observed' : 'policy_injected'
       };
     } catch (error) {
       failure = event.signal?.aborted ? event.signal.reason ?? error : error;
       outcome = {
         backend: 'fallback', fallbackReason: event.signal?.aborted ? 'cancelled' : error?.code ?? 'typesafe_request_failed',
-        action: event.signal?.aborted ? 'cancelled' : `unavailable_${config.fallback}`
+        action: event.signal?.aborted ? 'cancelled'
+          : config.mode === 'enforce' ? `unavailable_${config.fallback}` : 'unavailable_continue',
       };
     }
     if (turn !== current) throw Object.assign(new Error('The preflight belongs to an earlier turn.'), { code: 'stale_preflight' });
@@ -140,12 +145,21 @@ export function installJevGate(pi, { client, configPath = CONFIG_PATH } = {}) {
       mode: config.mode, fallback: config.fallback, ...outcome
     };
     pi.appendEntry(PREFLIGHT_STATE_TYPE, receipt);
-    if (failure && (config.fallback === 'block' || event.signal?.aborted)) {
+    if (failure && event.signal?.aborted) {
       current.status = 'blocked';
-      if (!event.signal?.aborted) ctx.abort?.();
+      throw failure;
+    }
+    if (failure && config.mode === 'enforce' && config.fallback === 'block') {
+      current.status = 'blocked';
+      ctx.abort?.();
       throw failure;
     }
     if (failure) recordDisposition(current, 'degraded_continue', receipt);
+    else if (config.mode === 'enforce' && receipt.signals?.decisionMode === 'direct_action'
+      && receipt.signals.decisionModeConfidence >= 0.5
+      && receipt.signals.additionalJevProbability < 0.5) {
+      recordDisposition(current, 'direct_continue', receipt);
+    }
     return receipt;
   }
 
@@ -160,7 +174,7 @@ export function installJevGate(pi, { client, configPath = CONFIG_PATH } = {}) {
     }
     try {
       const receipt = await prepared.promise;
-      if (config.mode !== 'enforce') return undefined;
+      if (config.mode !== 'enforce' && config.mode !== 'guide') return undefined;
       const base = Array.isArray(event.systemPrompt) ? event.systemPrompt : [event.systemPrompt].filter(Boolean);
       return { systemPrompt: [...base, formatPolicy(receipt)] };
     } catch (error) {
@@ -172,7 +186,7 @@ export function installJevGate(pi, { client, configPath = CONFIG_PATH } = {}) {
   pi.on('tool_call', async (event, ctx) => {
     const config = await loadConfig(configPath);
     if (config.mode !== 'enforce' || !GATED_TOOLS.has(event.toolName)) return undefined;
-    if (turn?.sessionId === sessionId(ctx) && (turn.status === 'judged' ||
+    if (turn?.sessionId === sessionId(ctx) && (turn.status === 'judged' || turn.status === 'direct_continue' ||
       (turn.status === 'degraded_continue' && config.fallback === 'continue'))) return undefined;
     return { block: true, reason: 'Jev checkpoint required before edit, write or bash: gather the relevant evidence, call jev-judge, then retry. Choice and score judgments require confidence >= 0.5. User settings /jev-gate control the policy.' };
   });
@@ -185,6 +199,12 @@ export function installJevGate(pi, { client, configPath = CONFIG_PATH } = {}) {
     return turn.id;
   }
 
+  function beginJudgment(turnId) {
+    if (!turn || turn.id !== turnId) return false;
+    turn.status = 'pending';
+    return true;
+  }
+
   function markJudged(turnId, receipt) {
     if (!turn || turn.id !== turnId || turn.sessionId !== receipt.sessionId) return false;
     if (isJudged(receipt)) recordDisposition(turn, 'judged', receipt);
@@ -192,5 +212,5 @@ export function installJevGate(pi, { client, configPath = CONFIG_PATH } = {}) {
     return turn.status === 'judged';
   }
 
-  return { clearPreparation, captureTurn, markJudged };
+  return { clearPreparation, captureTurn, beginJudgment, markJudged };
 }

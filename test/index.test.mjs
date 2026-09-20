@@ -109,6 +109,28 @@ test('registered tool execution unlocks the gate through the shared handlers', a
   assert.equal(await fixture.handlers.get('tool_call')({ toolName: 'bash', toolCallId: 'b1' }, fixture.ctx), undefined);
 });
 
+test('a fresh explicit judgment suspends a judged turn until it resolves', async t => {
+  let fail = false;
+  const fixture = await setup({
+    async judge() {
+      if (fail) throw Object.assign(new Error('offline'), { code: 'typesafe_timeout' });
+      return {
+        backend: 'typesafe',
+        model: 'jev-test',
+        usage: {},
+        answers: { decision: { type: 'choice', choice: 'safe', confidence: 0.9, probabilities: { safe: 0.9, fast: 0.1 } } },
+      };
+    },
+  }, { configFile: { mode: 'enforce', fallback: 'block' } });
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const params = { checkpoint: 'risk', kind: 'choice', state: 'relevant state', question: 'Which path?', labels: ['safe', 'fast'] };
+  await fixture.tools.get('jev-judge').execute('call-1', params, undefined, undefined, fixture.ctx);
+  assert.equal(await fixture.handlers.get('tool_call')({ toolName: 'edit', toolCallId: 'e1' }, fixture.ctx), undefined);
+  fail = true;
+  await assert.rejects(fixture.tools.get('jev-judge').execute('call-2', params, undefined, undefined, fixture.ctx));
+  assert.equal((await fixture.handlers.get('tool_call')({ toolName: 'edit', toolCallId: 'e2' }, fixture.ctx))?.block, true);
+});
+
 test('explicit judgment uses configured continue fallback', async t => {
   const fixture = await setup({ async judge() { throw Object.assign(new Error('offline'), { code: 'typesafe_timeout' }); } });
   t.after(() => rm(fixture.directory, { recursive: true, force: true }));
@@ -157,6 +179,24 @@ test('explicit judgment with block fallback stops the call', async t => {
   assert.equal(fixture.entries[0].data.answer, undefined);
 });
 
+test('explicit judgment keeps the configured block fallback in guide mode', async t => {
+  const fixture = await setup(
+    { async judge() { throw Object.assign(new Error('offline'), { code: 'typesafe_timeout' }); } },
+    { configFile: { mode: 'guide', fallback: 'block' } },
+  );
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  await assert.rejects(
+    fixture.tools.get('jev-judge').execute('call-1', {
+      checkpoint: 'risk',
+      kind: 'bool',
+      state: 'state',
+      question: 'Ready?',
+    }, undefined, undefined, fixture.ctx),
+    error => error.code === 'typesafe_timeout',
+  );
+  assert.equal(fixture.entries[0].data.action, 'unavailable_block');
+});
+
 test('malformed service answers follow the configured fallback without fabrication', async t => {
   const fixture = await setup({
     async judge() {
@@ -201,7 +241,7 @@ test('empty interactive command opens graphical mode and fallback settings', asy
       selections: [
         ({ title, options, dialog }) => {
           assert.equal(title, 'Jev Gate Mode');
-          assert.deepEqual(options.map(option => option.label), ['off', 'observe', 'enforce']);
+          assert.deepEqual(options.map(option => option.label), ['off', 'observe', 'guide', 'enforce']);
           assert.equal(dialog.initialIndex, 0);
           return 'enforce';
         },
@@ -234,4 +274,36 @@ test('choice and score judgments require distinct labels', async t => {
     }, undefined, undefined, fixture.ctx),
     /at least two distinct labels/,
   );
+});
+
+test('domain-neutral and legacy checkpoints both record receipts', async t => {
+  const fixture = await setup({
+    async judge() {
+      return {
+        backend: 'typesafe',
+        model: 'jev-test',
+        usage: {},
+        answers: { decision: { type: 'bool', bool: 0.82 } },
+      };
+    },
+  });
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const tool = fixture.tools.get('jev-judge');
+  const modern = await tool.execute('call-1', {
+    checkpoint: 'evidence_sufficiency',
+    kind: 'bool',
+    state: 'Test results',
+    question: 'Do the listed assertions exercise the changed behaviour?',
+  }, undefined, undefined, fixture.ctx);
+  assert.equal(modern.details.checkpoint, 'evidence_sufficiency');
+  assert.equal(modern.details.answer.value, 0.82);
+  assert.match(modern.content[0].text, /0\.82/);
+  const legacy = await tool.execute('call-2', {
+    checkpoint: 'architecture',
+    kind: 'bool',
+    state: 'state',
+    question: 'Does the condition hold?',
+  }, undefined, undefined, fixture.ctx);
+  assert.equal(legacy.details.checkpoint, 'architecture');
+  assert.match(tool.description, /all four hold/);
 });

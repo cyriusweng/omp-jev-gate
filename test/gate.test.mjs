@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { updateConfig } from '../src/configuration.mjs';
-import { GATED_TOOLS, PREFLIGHT_STATE_TYPE, installJevGate, normalizePreflight } from '../src/gate.mjs';
+import { CHECKPOINT_STATE_TYPE, GATED_TOOLS, PREFLIGHT_STATE_TYPE, installJevGate, normalizePreflight } from '../src/gate.mjs';
 
 async function setup(config, client) {
   const directory = await mkdtemp(join(tmpdir(), 'omp-jev-gate-'));
@@ -226,4 +226,148 @@ test('observe mode never intercepts tool calls', async t => {
 
   const result = await fixture.handlers.get('tool_call')({ toolName: 'edit', toolCallId: 'e7' }, fixture.ctx);
   assert.equal(result, undefined);
+});
+
+test('guide mode injects the policy without intercepting guarded tools', async t => {
+  const fixture = await setup({ mode: 'guide', fallback: 'continue' }, successClient());
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const result = await fixture.handlers.get('before_agent_start')({ prompt: 'task', systemPrompt: 'base' }, fixture.ctx);
+  assert.equal(result.systemPrompt[0], 'base');
+  assert.match(result.systemPrompt[1], /global; applies to every task domain/);
+  assert.match(result.systemPrompt[1], /Active mode: guide/);
+  assert.match(result.systemPrompt[1], /Guide is advisory/);
+  assert.match(result.systemPrompt[1], /Decision mode: compare_options/);
+  assert.equal(fixture.entries[0].data.action, 'policy_injected');
+  assert.equal(await fixture.handlers.get('tool_call')({ toolName: 'edit', toolCallId: 'e8' }, fixture.ctx), undefined);
+});
+
+test('observe and guide survive automatic preflight failure under block', async t => {
+  const error = Object.assign(new Error('offline'), { code: 'typesafe_timeout' });
+  for (const mode of ['observe', 'guide']) {
+    const fixture = await setup({ mode, fallback: 'block' }, { async judge() { throw error; } });
+    t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+    const result = await fixture.handlers.get('before_agent_start')({ prompt: 'task', systemPrompt: ['base'] }, fixture.ctx);
+    if (mode === 'observe') assert.equal(result, undefined);
+    else assert.match(result.systemPrompt.at(-1), /Preflight unavailable: typesafe_timeout/);
+    assert.equal(fixture.aborted, 0, mode);
+    assert.equal(fixture.entries[0].data.action, 'unavailable_continue', mode);
+    assert.equal(fixture.entries[0].data.fallbackReason, 'typesafe_timeout', mode);
+    assert.equal(fixture.entries[0].data.fallback, 'block', mode);
+    assert.equal(await fixture.handlers.get('tool_call')({ toolName: 'write', toolCallId: 'w9' }, fixture.ctx), undefined, mode);
+  }
+});
+
+test('automatic preflight cancellation propagates in every mode', async t => {
+  for (const mode of ['observe', 'guide', 'enforce']) {
+    const controller = new AbortController();
+    const fixture = await setup({ mode, fallback: 'block' }, {
+      async judge() {
+        controller.abort(new Error('fixture cancelled'));
+        throw new Error('fixture cancelled');
+      },
+    });
+    t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+    await assert.rejects(
+      fixture.handlers.get('before_agent_start')({ prompt: 'task', systemPrompt: [], signal: controller.signal }, fixture.ctx),
+      /fixture cancelled/,
+      mode,
+    );
+    assert.equal(fixture.entries[0].data.action, 'cancelled', mode);
+    assert.equal(fixture.entries[0].data.fallbackReason, 'cancelled', mode);
+    assert.equal(fixture.entries.some(entry => entry.type === CHECKPOINT_STATE_TYPE), false, mode);
+  }
+});
+
+test('global policy states trigger conditions, direct paths and answer semantics', async t => {
+  const fixture = await setup({ mode: 'enforce', fallback: 'continue' }, successClient());
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const result = await fixture.handlers.get('before_agent_start')({ prompt: 'task', systemPrompt: [] }, fixture.ctx);
+  const policy = result.systemPrompt.at(-1);
+  assert.match(policy, /global; applies to every task domain/);
+  assert.match(policy, /Active mode: enforce/);
+  assert.match(policy, /Explicit jev-judge calls follow the configured continue or block fallback in every mode/);
+  assert.match(policy, /Preflight supplies entry signals and, in enforce mode, may set the initial direct disposition/);
+  assert.match(policy, /all four hold/);
+  assert.match(policy, /selection, scoring or evidence-sufficiency judgment/);
+  assert.match(policy, /materially change the path, scope, risk handling, verification depth or delivery conclusion/);
+  assert.match(policy, /Direct paths stay direct/);
+  assert.match(policy, /low support on an evidence-sufficiency question calls for more evidence/);
+  assert.match(policy, /may reuse a completed checkpoint/);
+});
+
+function directClient(direct, additional, confidence = 0.8, counter = { calls: 0 }) {
+  return {
+    async judge() {
+      counter.calls += 1;
+      return {
+        backend: 'typesafe',
+        model: 'jev-test',
+        usage: {},
+        answers: {
+          decision_mode: { type: 'choice', choice: direct ? 'direct_action' : 'compare_options', confidence, probabilities: { direct_action: direct ? 0.8 : 0.1, compare_options: direct ? 0.1 : 0.8, clarify_user: 0.1 } },
+          reasoning_depth: { type: 'score', score: 0.6, confidence: 0.8, probabilities: { 0: 0.4, 1: 0.6, 2: 0, 3: 0 } },
+          verification_depth: { type: 'choice', choice: 'light', confidence: 0.8, probabilities: { light: 0.8, targeted: 0.1, broad: 0.1 } },
+          additional_jev: { type: 'bool', bool: additional },
+        },
+      };
+    },
+  };
+}
+
+test('direct disposition respects the 0.5 decision-mode confidence boundary', async t => {
+  for (const [confidence, allowed] of [[0.499, false], [0.5, true]]) {
+    const fixture = await setup({ mode: 'enforce', fallback: 'continue' }, directClient(true, 0.2, confidence));
+    t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+    await fixture.handlers.get('before_agent_start')({ prompt: 'rename this file', systemPrompt: [] }, fixture.ctx);
+    const result = await fixture.handlers.get('tool_call')({ toolName: 'bash', toolCallId: 'b1' }, fixture.ctx);
+    assert.equal(result === undefined, allowed, `confidence ${confidence}`);
+  }
+});
+
+test('direct preflight disposition allows the first guarded tool', async t => {
+  const fixture = await setup({ mode: 'enforce', fallback: 'continue' }, directClient(true, 0.2));
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  await fixture.handlers.get('before_agent_start')({ prompt: 'rename this file', systemPrompt: [] }, fixture.ctx);
+  assert.equal(await fixture.handlers.get('tool_call')({ toolName: 'bash', toolCallId: 'b1' }, fixture.ctx), undefined);
+  const disposition = fixture.entries.find(entry => entry.type === CHECKPOINT_STATE_TYPE);
+  assert.equal(disposition.data.status, 'direct_continue');
+});
+
+test('direct_action at the 0.5 threshold still requires a checkpoint', async t => {
+  const fixture = await setup({ mode: 'enforce', fallback: 'continue' }, directClient(true, 0.5));
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  await fixture.handlers.get('before_agent_start')({ prompt: 'edit now', systemPrompt: [] }, fixture.ctx);
+  assert.equal((await fixture.handlers.get('tool_call')({ toolName: 'edit', toolCallId: 'e1' }, fixture.ctx))?.block, true);
+  assert.equal(fixture.entries.some(entry => entry.type === CHECKPOINT_STATE_TYPE), false);
+});
+
+test('compare_options preflight keeps the checkpoint requirement', async t => {
+  const fixture = await setup({ mode: 'enforce', fallback: 'continue' }, directClient(false, 0.2));
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  await fixture.handlers.get('before_agent_start')({ prompt: 'compare approaches', systemPrompt: [] }, fixture.ctx);
+  assert.equal((await fixture.handlers.get('tool_call')({ toolName: 'write', toolCallId: 'w1' }, fixture.ctx))?.block, true);
+});
+
+test('explicit judgment upgrades a direct turn to judged', async t => {
+  const fixture = await setup({ mode: 'enforce', fallback: 'continue' }, directClient(true, 0.2));
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  await fixture.handlers.get('before_agent_start')({ prompt: 'quick check then edit', systemPrompt: [] }, fixture.ctx);
+  const turnId = fixture.gate.captureTurn(fixture.ctx);
+  assert.equal(fixture.gate.markJudged(turnId, JUDGED_CHOICE), true);
+  const statuses = fixture.entries.filter(entry => entry.type === CHECKPOINT_STATE_TYPE).map(entry => entry.data.status);
+  assert.deepEqual(statuses, ['direct_continue', 'judged']);
+});
+
+test('a fresh judgment suspends a direct turn until it resolves', async t => {
+  const fixture = await setup({ mode: 'enforce', fallback: 'continue' }, directClient(true, 0.2));
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  await fixture.handlers.get('before_agent_start')({ prompt: 'task', systemPrompt: [] }, fixture.ctx);
+  assert.equal(await fixture.handlers.get('tool_call')({ toolName: 'edit', toolCallId: 'e1' }, fixture.ctx), undefined);
+  const turnId = fixture.gate.captureTurn(fixture.ctx);
+  assert.equal(fixture.gate.beginJudgment(turnId), true);
+  assert.equal((await fixture.handlers.get('tool_call')({ toolName: 'edit', toolCallId: 'e2' }, fixture.ctx))?.block, true);
+  assert.equal(fixture.gate.markJudged(turnId, LOW_CONFIDENCE_CHOICE), false);
+  assert.equal((await fixture.handlers.get('tool_call')({ toolName: 'edit', toolCallId: 'e3' }, fixture.ctx))?.block, true);
+  assert.equal(fixture.gate.markJudged(turnId, JUDGED_CHOICE), true);
+  assert.equal(await fixture.handlers.get('tool_call')({ toolName: 'edit', toolCallId: 'e4' }, fixture.ctx), undefined);
 });

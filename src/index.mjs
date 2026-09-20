@@ -4,10 +4,15 @@ import { createJevClient, validateAnswer } from './jev-client.mjs';
 
 export const JUDGMENT_STATE_TYPE = 'omp-jev-gate-judgment-v1';
 export const CHECKPOINTS = [
+  'problem_framing',
+  'approach_selection',
+  'candidate_filtering',
+  'evidence_sufficiency',
+  'risk',
+  'verification_scope',
+  'delivery_readiness',
   'architecture',
   'implementation_path',
-  'candidate_filtering',
-  'risk',
   'test_coverage',
   'delivery_preflight',
   'other',
@@ -115,12 +120,13 @@ function formatStatus(config) {
   const fallbackDescription = config.fallback === 'block'
     ? 'the affected judgment stops and guarded tools stay blocked'
     : 'a degraded receipt is recorded and the current agent reasoning continues';
-  return `Jev Gate mode: ${config.mode}; fallback: ${config.fallback} (${fallbackDescription}). Automatic preflight sends prompt text to TypeSafe in observe and enforce modes. Enforce checks the first edit, write or bash call for a completed checkpoint or an audited continue disposition. Choice and score judgments require confidence >= 0.5; boolean judgments record their probability. Explicit jev-judge calls send their supplied state and question.`;
+  return `Jev Gate mode: ${config.mode}; fallback: ${config.fallback} (${fallbackDescription}). Automatic preflight sends prompt text to TypeSafe in observe, guide and enforce modes and never aborts an observing or guiding session; enforce blocks on automatic preflight failure. Guide injects the same global policy while edit, write and bash stay free. Enforce checks the first edit, write or bash call for a completed checkpoint, a direct preflight disposition or an audited continue disposition. Choice and score judgments require confidence >= 0.5; boolean judgments record their probability. Explicit jev-judge calls send their supplied state and question and move the turn to pending until a disposition resolves.`;
 }
 
 const MODE_DESCRIPTIONS = {
   off: 'Skip automatic prompt preflight',
-  observe: 'Record Jev guidance while preserving the current system prompt',
+  observe: 'Record Jev entry signals while preserving the current system prompt',
+  guide: 'Inject the global policy without intercepting guarded tools',
   enforce: 'Apply preflight guidance and check the first edit, write or bash call',
 };
 
@@ -160,7 +166,7 @@ export default function jevGateExtension(pi, options = {}) {
     label: 'Jev Judgment',
     loadMode: 'essential',
     approval: 'read',
-    description: 'Ask TypeSafe Jev one bounded choice, score or boolean question. Use it at material judgment checkpoints after gathering the relevant state.',
+    description: 'Ask TypeSafe Jev one bounded choice, score or boolean question at a material judgment checkpoint in any task domain. Call it when all four hold: the step is a selection, scoring or evidence-sufficiency judgment; the question fits choice, bool or score; the gathered evidence forms a clear state; and the answer would materially change the path, scope, risk handling, verification depth or delivery conclusion. Deterministic facts, computations, user-owned permission choices and settled plans proceed directly.',
     parameters: pi.zod.object({
       checkpoint: pi.zod.enum(CHECKPOINTS),
       kind: pi.zod.enum(['choice', 'bool', 'score']),
@@ -170,6 +176,7 @@ export default function jevGateExtension(pi, options = {}) {
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const turnId = gate.captureTurn(ctx);
+      gate.beginJudgment(turnId);
       const receipt = await runExplicitJudgment(pi, client, params, ctx, signal, configPath);
       gate.markJudged(turnId, receipt);
       return { content: [{ type: 'text', text: formatJudgment(receipt) }], details: receipt };
@@ -177,7 +184,7 @@ export default function jevGateExtension(pi, options = {}) {
   });
 
   pi.registerCommand('jev-gate', {
-    description: 'Configure automatic Jev preflight: status, off, observe or enforce, with continue or block fallback.',
+    description: 'Configure automatic Jev preflight: status, off, observe, guide or enforce, with continue or block fallback.',
     async handler(args, ctx) {
       try {
         const tokens = args.trim().split(/\s+/).filter(Boolean);
@@ -194,7 +201,7 @@ export default function jevGateExtension(pi, options = {}) {
           ctx.ui.notify(formatStatus(current), 'info');
           return;
         }
-        if (!MODES.has(action)) throw new Error('Use /jev-gate status|off|observe|enforce [continue|block].');
+        if (!MODES.has(action)) throw new Error('Use /jev-gate status|off|observe|guide|enforce [continue|block].');
         const fallback = tokens[1] ?? current.fallback;
         if (!FALLBACKS.has(fallback) || tokens.length > 2) {
           throw new Error('Use fallback continue or block.');

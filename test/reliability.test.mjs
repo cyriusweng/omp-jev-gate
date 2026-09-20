@@ -50,6 +50,12 @@ async function fixture(t, fallback = 'block') {
       if ((explicit && control.fail) || (!explicit && control.failPreflight)) throw new Error('fixture offline');
       if (explicit && control.wait) await control.wait();
       const answers = Object.fromEntries(Object.entries(body.questions).map(([id, q]) => [id, nativeAnswer(q, control.confidence)]));
+      if (!explicit) {
+        answers.decision_mode = {
+          type: 'choice', choice: 'compare_options', confidence: control.confidence,
+          probabilities: { direct_action: 0.1, compare_options: 0.8, clarify_user: 0.1 },
+        };
+      }
       if (explicit && control.transform) answers.decision = control.transform(answers.decision);
       return { ok: true, async json() { return { model: 'jev-fixture', answers, usage: { input_tokens: 4, output_tokens: 2 } }; } };
     },
