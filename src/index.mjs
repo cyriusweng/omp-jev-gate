@@ -107,6 +107,38 @@ function formatStatus(config) {
   return `Jev Gate mode: ${config.mode}; fallback: ${config.fallback}. Automatic preflight sends prompt text to TypeSafe in observe and enforce modes. Explicit jev-judge calls send their supplied state and question.`;
 }
 
+const MODE_DESCRIPTIONS = {
+  off: 'Skip automatic prompt preflight',
+  observe: 'Record Jev guidance while preserving the current system prompt',
+  enforce: 'Apply Jev guidance to the current system prompt',
+};
+
+const FALLBACK_DESCRIPTIONS = {
+  continue: 'Record a fallback receipt and continue with the current agent',
+  block: 'Stop the affected judgment when TypeSafe is unavailable',
+};
+
+async function pickSettings(ctx, current) {
+  const modes = [...MODES];
+  const mode = await ctx.ui.select(
+    'Jev Gate Mode',
+    modes.map(label => ({ label, description: MODE_DESCRIPTIONS[label] })),
+    { initialIndex: Math.max(0, modes.indexOf(current.mode)), helpText: 'Use arrow keys to navigate, Enter to select, Escape to cancel.' },
+  );
+  if (mode === undefined) return undefined;
+  if (!MODES.has(mode)) throw new Error('Select a Jev Gate mode from the menu.');
+
+  const fallbacks = [...FALLBACKS];
+  const fallback = await ctx.ui.select(
+    'Jev Gate Fallback',
+    fallbacks.map(label => ({ label, description: FALLBACK_DESCRIPTIONS[label] })),
+    { initialIndex: Math.max(0, fallbacks.indexOf(current.fallback)), helpText: 'Use arrow keys to navigate, Enter to select, Escape to cancel.' },
+  );
+  if (fallback === undefined) return undefined;
+  if (!FALLBACKS.has(fallback)) throw new Error('Select a Jev Gate fallback from the menu.');
+  return { mode, fallback };
+}
+
 export default function jevGateExtension(pi, options = {}) {
   const configPath = options.configPath ?? CONFIG_PATH;
   const client = options.client ?? createJevClient(pi, options);
@@ -136,8 +168,15 @@ export default function jevGateExtension(pi, options = {}) {
     async handler(args, ctx) {
       try {
         const tokens = args.trim().split(/\s+/).filter(Boolean);
-        const action = tokens[0] ?? 'status';
         const current = await loadConfig(configPath);
+        if (tokens.length === 0 && ctx.hasUI) {
+          const settings = await pickSettings(ctx, current);
+          if (!settings) return;
+          const saved = await updateConfig(settings, { path: configPath, expectedConfig: current });
+          ctx.ui.notify(formatStatus(saved), 'info');
+          return;
+        }
+        const action = tokens[0] ?? 'status';
         if (action === 'status') {
           ctx.ui.notify(formatStatus(current), 'info');
           return;

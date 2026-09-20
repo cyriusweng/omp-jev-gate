@@ -9,7 +9,7 @@ function chain() {
   return { min() { return this; }, max() { return this; }, optional() { return this; } };
 }
 
-async function setup(client) {
+async function setup(client, options = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'omp-jev-gate-index-'));
   const configPath = join(directory, 'config.json');
   const handlers = new Map();
@@ -17,6 +17,7 @@ async function setup(client) {
   const commands = new Map();
   const entries = [];
   const notices = [];
+  const selections = [...(options.selections ?? [])];
   const pi = {
     zod: {
       object(value) { return value; },
@@ -31,10 +32,20 @@ async function setup(client) {
   };
   jevGateExtension(pi, { client, configPath });
   const ctx = {
+    hasUI: options.hasUI ?? false,
     sessionManager: { getSessionId: () => 'session-1' },
-    ui: { notify(message, level) { notices.push({ message, level }); } },
+    ui: {
+      notify(message, level) { notices.push({ message, level }); },
+      async select(title, selectOptions, dialog) {
+        assert.ok(selections.length, `Unexpected selector: ${title}`);
+        const selection = selections.shift();
+        return typeof selection === 'function'
+          ? selection({ title, options: selectOptions, dialog })
+          : selection;
+      },
+    },
   };
-  return { directory, configPath, handlers, tools, commands, entries, notices, ctx };
+  return { directory, configPath, handlers, tools, commands, entries, notices, selections, ctx };
 }
 
 test('plugin registers an essential typed judgment tool', async t => {
@@ -87,6 +98,34 @@ test('command configures enforce mode and reports disclosure', async t => {
   assert.match(fixture.notices.at(-1).message, /sends prompt text to TypeSafe/);
   await fixture.commands.get('jev-gate').handler('status', fixture.ctx);
   assert.match(fixture.notices.at(-1).message, /mode: enforce/);
+});
+
+test('empty interactive command opens graphical mode and fallback settings', async t => {
+  const fixture = await setup(
+    { async judge() { throw new Error('unused'); } },
+    {
+      hasUI: true,
+      selections: [
+        ({ title, options, dialog }) => {
+          assert.equal(title, 'Jev Gate Mode');
+          assert.deepEqual(options.map(option => option.label), ['off', 'observe', 'enforce']);
+          assert.equal(dialog.initialIndex, 0);
+          return 'enforce';
+        },
+        ({ title, options, dialog }) => {
+          assert.equal(title, 'Jev Gate Fallback');
+          assert.deepEqual(options.map(option => option.label), ['continue', 'block']);
+          assert.equal(dialog.initialIndex, 0);
+          return 'block';
+        },
+      ],
+    },
+  );
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+
+  await fixture.commands.get('jev-gate').handler('', fixture.ctx);
+  assert.match(fixture.notices.at(-1).message, /mode: enforce; fallback: block/);
+  assert.equal(fixture.selections.length, 0);
 });
 
 test('choice and score judgments require distinct labels', async t => {
