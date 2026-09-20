@@ -110,11 +110,12 @@ test('choice and score malformed answers follow the block policy', async t => {
     ['choice', a => ({ ...a, confidence: 1.1 })],
     ['choice', a => ({ ...a, confidence: -0.1 })],
     ['choice', a => ({ ...a, probabilities: { safe: 0.8 } })],
-    ['choice', a => ({ ...a, probabilities: { safe: 0.8, fast: 0.5 } })],
+    ['choice', a => ({ ...a, probabilities: { safe: 0.8, fast: 0.5, extra: -0.3 } })],
     ['choice', a => ({ ...a, choice: 'unknown' })],
-    ['choice', a => ({ ...a, choice: 'fast' })],
+    ['choice', a => ({ ...a, choice: 42 })],
     ['score', a => ({ ...a, score: 3 })],
-    ['score', a => ({ ...a, score: 0.1 })],
+    ['score', a => ({ ...a, score: -0.1 })],
+    ['score', a => ({ ...a, score: 'mid' })],
     ['bool', () => ({ type: 'noul', noul: 1.5 })],
   ];
   for (const [kind, transform] of cases) {

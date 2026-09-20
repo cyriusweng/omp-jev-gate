@@ -132,6 +132,33 @@ test('client rejects malformed answers with a stable code', async () => {
   }
 });
 
+test('client accepts native answers without deriving consistency from rounded fields', async () => {
+  const prior = process.env.TYPESAFE_API_KEY;
+  process.env.TYPESAFE_API_KEY = 'environment-secret';
+  try {
+    const client = createJevClient({}, {
+      fetch: async () => response({
+        answers: {
+          near: { type: 'choice', choice: 'a', confidence: 0.7, probabilities: { a: 0.334, b: 0.333, c: 0.332 } },
+          other: { type: 'choice', choice: 'b', confidence: 0.55, probabilities: { a: 0.501, b: 0.499 } },
+          depth: { type: 'score', score: 0.9, confidence: 0.6, probabilities: { 0: 0.3, 1: 0.4, 2: 0.3 } },
+        },
+      }),
+    });
+    const result = await client.judge('state', {
+      near: { type: 'choice', instructions: 'n', criteria: { a: null, b: null, c: null } },
+      other: { type: 'choice', instructions: 'o', criteria: { a: null, b: null } },
+      depth: { type: 'score', instructions: 'd', criteria: ['low', 'mid', 'high'] },
+    });
+    assert.equal(result.answers.near.choice, 'a');
+    assert.equal(result.answers.other.choice, 'b');
+    assert.equal(result.answers.depth.score, 0.9);
+  } finally {
+    if (prior === undefined) delete process.env.TYPESAFE_API_KEY;
+    else process.env.TYPESAFE_API_KEY = prior;
+  }
+});
+
 test('client reports an absent credential', async () => {
   const prior = process.env.TYPESAFE_API_KEY;
   delete process.env.TYPESAFE_API_KEY;

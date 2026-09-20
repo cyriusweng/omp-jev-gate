@@ -59,17 +59,13 @@ export function validateAnswer(question, raw) {
  if (!validProbability(raw.confidence) || !probabilities ||
   typeof probabilities !== 'object' || Array.isArray(probabilities) ||
   Object.keys(probabilities).length !== labels.length ||
-  labels.some(label => !Object.hasOwn(probabilities, label) || !validProbability(probabilities[label])) ||
-  Math.abs(labels.reduce((sum, label) => sum + probabilities[label], 0) - 1) > 1e-4) {
+  labels.some(label => !Object.hasOwn(probabilities, label) || !validProbability(probabilities[label]))) {
   throw invalidAnswer();
  }
  if (question.type === 'choice') {
-  if (!labels.includes(raw.choice) ||
-   probabilities[raw.choice] + 1e-4 < Math.max(...Object.values(probabilities))) throw invalidAnswer();
+  if (!labels.includes(raw.choice)) throw invalidAnswer();
  } else {
-  const expected = labels.reduce((sum, label) => sum + Number(label) * probabilities[label], 0);
-  if (!Number.isFinite(raw.score) || raw.score < 0 || raw.score > labels.length - 1 ||
-   Math.abs(raw.score - expected) > 1e-3) throw invalidAnswer();
+  if (!Number.isFinite(raw.score) || raw.score < 0 || raw.score > labels.length - 1) throw invalidAnswer();
  }
  return raw;
 }

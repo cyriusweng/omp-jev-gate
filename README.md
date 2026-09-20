@@ -89,6 +89,12 @@ Automatic preflight sends the prompt text, limited to 12,000 characters, to Type
 
 Unavailable judgments have a fallback backend and an unavailable action with the relevant reason. Receipts distinguish successful TypeSafe answers, unresolved low-confidence judgments, degraded continuation and cancellation. Checkpoint-disposition entries identify their session, turn and guarded-tool scope.
 
+## Troubleshooting
+
+TypeSafe answers are validated against the native response contract: answer type, required fields, finite probabilities in the 0–1 range, allowed choice labels and in-range scores. This matches OMP's built-in Judgment parsing. The plugin derives no consistency requirements from rounded probability fields, so a valid native answer whose probabilities sum to 0.999 or whose chosen label differs from what local arithmetic would rank first is accepted. Genuinely malformed answers keep the `typesafe_answer_invalid` code and follow the configured fallback.
+
+If you upgrade or edit the plugin while a session is running, restart the session or reload the plugin before judging its behaviour; the previously loaded code keeps serving the current process. With `enforce block`, an unavailable or invalid TypeSafe response stops the affected turn — check `/jev-gate status`, the credential and recent preflight receipts before attributing the stop to the network.
+
 ## Verification and references
 
 Requires Node.js 22 or later. The tests cover native API decoding, registered-tool execution, confidence boundaries, the global trigger policy, mode-specific preflight failure handling, malformed responses, both failure policies, cancellation, asynchronous session changes, turn resets and interactive settings.
