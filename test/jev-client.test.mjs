@@ -16,7 +16,14 @@ test('client sends typed questions with environment authentication', async () =>
         request = { url, options };
         return response({
           model: 'jev-test',
-          answers: { decision: { type: 'choice', choice: 'a', confidence: 0.8 } },
+          answers: {
+            decision: {
+              type: 'choice',
+              choice: 'a',
+              confidence: 0.8,
+              probabilities: { a: 0.8, b: 0.2 },
+            },
+          },
           usage: { input_tokens: 12, output_tokens: 3 },
         });
       },
@@ -31,6 +38,8 @@ test('client sends typed questions with environment authentication', async () =>
     });
     assert.equal(result.model, 'jev-test');
     assert.deepEqual(result.usage, { inputTokens: 12, outputTokens: 3 });
+    assert.equal(result.answers.decision.choice, 'a');
+    assert.equal(result.answers.decision.confidence, 0.8);
   } finally {
     if (prior === undefined) delete process.env.TYPESAFE_API_KEY;
     else process.env.TYPESAFE_API_KEY = prior;
@@ -48,10 +57,10 @@ test('client loads and caches the native OMP TypeSafe token', async () => {
         assert.deepEqual(args, ['token', 'typesafe']);
         return { code: 0, stdout: 'native-token-value\n' };
       },
-      fetch: async () => response({ answers: { decision: { type: 'choice', choice: 'yes', confidence: 0.7 } } }),
+      fetch: async () => response({ answers: { decision: { type: 'noul', noul: 0.7 } } }),
     });
-    await client.judge('one', { decision: { type: 'bool' } });
-    await client.judge('two', { decision: { type: 'bool' } });
+    await client.judge('one', { decision: { type: 'noul', instructions: 'one' } });
+    await client.judge('two', { decision: { type: 'noul', instructions: 'two' } });
     assert.equal(calls, 1);
   } finally {
     if (prior === undefined) delete process.env.TYPESAFE_API_KEY;
@@ -59,7 +68,7 @@ test('client loads and caches the native OMP TypeSafe token', async () => {
   }
 });
 
-test('client adapts boolean and score questions through TypeSafe choices', async () => {
+test('client sends native noul and score questions and preserves native answers', async () => {
   const prior = process.env.TYPESAFE_API_KEY;
   process.env.TYPESAFE_API_KEY = 'environment-secret';
   let sentQuestions;
@@ -69,8 +78,14 @@ test('client adapts boolean and score questions through TypeSafe choices', async
         sentQuestions = JSON.parse(options.body).questions;
         return response({
           answers: {
-            supported: { type: 'choice', choice: 'yes', confidence: 0.75, probabilities: { yes: 0.75, no: 0.25 } },
-            depth: { type: 'choice', choice: '2', confidence: 0.6, probabilities: { 0: 0.1, 1: 0.2, 2: 0.6, 3: 0.1 } },
+            supported: { type: 'noul', noul: 0.75 },
+            depth: {
+              type: 'score',
+              score: 1.7,
+              legend: { 0: 'zero', 1: 'one', 2: 'two', 3: 'three' },
+              probabilities: { 0: 0.1, 1: 0.2, 2: 0.6, 3: 0.1 },
+              confidence: 0.6,
+            },
           },
         });
       },
@@ -79,12 +94,38 @@ test('client adapts boolean and score questions through TypeSafe choices', async
       supported: { type: 'bool', instructions: 'Supported?' },
       depth: { type: 'score', instructions: 'Depth?', criteria: ['zero', 'one', 'two', 'three'] },
     });
-    assert.equal(sentQuestions.supported.type, 'choice');
-    assert.deepEqual(Object.keys(sentQuestions.supported.criteria), ['yes', 'no']);
-    assert.deepEqual(sentQuestions.depth.criteria, { 0: 'zero', 1: 'one', 2: 'two', 3: 'three' });
+    assert.equal(sentQuestions.supported.type, 'noul');
+    assert.deepEqual(sentQuestions.depth.criteria, ['zero', 'one', 'two', 'three']);
     assert.deepEqual(result.answers.supported, { type: 'bool', bool: 0.75 });
-    assert.equal(result.answers.depth.type, 'score');
     assert.equal(result.answers.depth.score, 1.7);
+    assert.equal(result.answers.depth.confidence, 0.6);
+  } finally {
+    if (prior === undefined) delete process.env.TYPESAFE_API_KEY;
+    else process.env.TYPESAFE_API_KEY = prior;
+  }
+});
+
+test('client rejects malformed answers with a stable code', async () => {
+  const prior = process.env.TYPESAFE_API_KEY;
+  process.env.TYPESAFE_API_KEY = 'environment-secret';
+  const cases = [
+    { answers: {} },
+    { answers: { decision: { type: 'noul', noul: 1.4 } } },
+    { answers: { decision: { type: 'choice', choice: 'unknown', confidence: 0.9, probabilities: { a: 0.5, b: 0.5 } } } },
+    { answers: { decision: { type: 'choice', choice: 'a', confidence: 0.9, probabilities: { a: 0.9 } } } },
+    { answers: { decision: { type: 'choice', choice: 'a', confidence: 1.4, probabilities: { a: 0.9, b: 0.1 } } } },
+    { answers: { decision: { type: 'score', score: 9, confidence: 0.9, probabilities: { 0: 0.5, 1: 0.5 } } } },
+    { answers: { decision: { type: 'noul', noul: 'high' } } },
+  ];
+  try {
+    for (const payload of cases) {
+      const client = createJevClient({}, { fetch: async () => response(payload) });
+      await assert.rejects(
+        client.judge('state', { decision: { type: 'noul', instructions: 'q' } }),
+        error => error.code === 'typesafe_answer_invalid',
+        `expected rejection for ${JSON.stringify(payload)}`,
+      );
+    }
   } finally {
     if (prior === undefined) delete process.env.TYPESAFE_API_KEY;
     else process.env.TYPESAFE_API_KEY = prior;
@@ -99,7 +140,7 @@ test('client reports an absent credential', async () => {
       exec: async () => ({ code: 1, stdout: '' }),
       fetch: async () => { throw new Error('unexpected'); },
     });
-    await assert.rejects(client.judge('state', { decision: { type: 'bool' } }), error => {
+    await assert.rejects(client.judge('state', { decision: { type: 'noul', instructions: 'q' } }), error => {
       assert.equal(error.code, 'typesafe_credential_unavailable');
       return true;
     });
@@ -114,7 +155,7 @@ test('client gives HTTP failures stable error codes', async () => {
   process.env.TYPESAFE_API_KEY = 'environment-secret';
   try {
     const client = createJevClient({}, { fetch: async () => response({}, { ok: false, status: 429 }) });
-    await assert.rejects(client.judge('state', { decision: { type: 'bool' } }), error => {
+    await assert.rejects(client.judge('state', { decision: { type: 'noul', instructions: 'q' } }), error => {
       assert.equal(error.code, 'typesafe_http_429');
       return true;
     });

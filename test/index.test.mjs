@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -12,6 +12,9 @@ function chain() {
 async function setup(client, options = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'omp-jev-gate-index-'));
   const configPath = join(directory, 'config.json');
+  if (options.configFile) {
+    await writeFile(configPath, JSON.stringify(options.configFile));
+  }
   const handlers = new Map();
   const tools = new Map();
   const commands = new Map();
@@ -30,7 +33,7 @@ async function setup(client, options = {}) {
     registerTool(tool) { tools.set(tool.name, tool); },
     registerCommand(name, command) { commands.set(name, command); },
   };
-  jevGateExtension(pi, { client, configPath, fallback: options.fallback });
+  jevGateExtension(pi, { client, configPath });
   const ctx = {
     hasUI: options.hasUI ?? false,
     sessionManager: { getSessionId: () => 'session-1' },
@@ -76,6 +79,36 @@ test('plugin registers an essential typed judgment tool', async t => {
   assert.equal(fixture.entries[0].data.state, undefined);
 });
 
+test('registered tool execution unlocks the gate through the shared handlers', async t => {
+  const fixture = await setup({
+    async judge() {
+      return {
+        backend: 'typesafe',
+        model: 'jev-test',
+        usage: {},
+        answers: { decision: { type: 'choice', choice: 'safe', confidence: 0.88, probabilities: { safe: 0.88, fast: 0.12 } } },
+      };
+    },
+  }, { configFile: { mode: 'enforce', fallback: 'continue' } });
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+
+  assert.equal(
+    (await fixture.handlers.get('tool_call')({ toolName: 'edit', toolCallId: 'e1' }, fixture.ctx))?.block,
+    true,
+  );
+
+  await fixture.tools.get('jev-judge').execute('call-1', {
+    checkpoint: 'risk',
+    kind: 'choice',
+    state: 'relevant state',
+    question: 'Which path?',
+    labels: ['safe', 'fast'],
+  }, undefined, undefined, fixture.ctx);
+
+  assert.equal(await fixture.handlers.get('tool_call')({ toolName: 'edit', toolCallId: 'e2' }, fixture.ctx), undefined);
+  assert.equal(await fixture.handlers.get('tool_call')({ toolName: 'bash', toolCallId: 'b1' }, fixture.ctx), undefined);
+});
+
 test('explicit judgment uses configured continue fallback', async t => {
   const fixture = await setup({ async judge() { throw Object.assign(new Error('offline'), { code: 'typesafe_timeout' }); } });
   t.after(() => rm(fixture.directory, { recursive: true, force: true }));
@@ -89,8 +122,53 @@ test('explicit judgment uses configured continue fallback', async t => {
   assert.equal(result.details.fallbackReason, 'typesafe_timeout');
 });
 
-test('jev fallback records a deterministic conservative judgment', async t => {
-  const fixture = await setup({ async judge() { throw Object.assign(new Error('offline'), { code: 'typesafe_timeout' }); } }, { fallback: 'jev' });
+test('explicit judgment with continue fallback records a degraded disposition without an answer', async t => {
+  const fixture = await setup({ async judge() { throw Object.assign(new Error('offline'), { code: 'typesafe_timeout' }); } });
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const result = await fixture.tools.get('jev-judge').execute('call-1', {
+    checkpoint: 'delivery_preflight',
+    kind: 'bool',
+    state: 'state',
+    question: 'Ready?',
+  }, undefined, undefined, fixture.ctx);
+  assert.equal(result.details.backend, 'fallback');
+  assert.equal(result.details.fallbackReason, 'typesafe_timeout');
+  assert.equal(result.details.answer, undefined);
+  assert.match(result.content[0].text, /degraded disposition/);
+});
+
+test('explicit judgment with block fallback stops the call', async t => {
+  const fixture = await setup(
+    { async judge() { throw Object.assign(new Error('offline'), { code: 'typesafe_timeout' }); } },
+    { configFile: { mode: 'enforce', fallback: 'block' } },
+  );
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  await assert.rejects(
+    fixture.tools.get('jev-judge').execute('call-1', {
+      checkpoint: 'delivery_preflight',
+      kind: 'bool',
+      state: 'state',
+      question: 'Ready?',
+    }, undefined, undefined, fixture.ctx),
+    error => error.code === 'typesafe_timeout',
+  );
+  assert.equal(fixture.entries.length, 1);
+  assert.equal(fixture.entries[0].data.action, 'unavailable_block');
+  assert.equal(fixture.entries[0].data.answer, undefined);
+});
+
+test('malformed service answers follow the configured fallback without fabrication', async t => {
+  const fixture = await setup({
+    async judge() {
+      return {
+        backend: 'typesafe',
+        model: 'jev-test',
+        answers: {
+          decision: { type: 'choice', choice: 'safe', confidence: 0.9, probabilities: { wrong: 0.9, fast: 0.1 } },
+        },
+      };
+    },
+  });
   t.after(() => rm(fixture.directory, { recursive: true, force: true }));
   const result = await fixture.tools.get('jev-judge').execute('call-1', {
     checkpoint: 'risk',
@@ -99,19 +177,9 @@ test('jev fallback records a deterministic conservative judgment', async t => {
     question: 'Which path?',
     labels: ['safe', 'fast'],
   }, undefined, undefined, fixture.ctx);
-  assert.equal(result.details.backend, 'deterministic-fallback');
-  assert.equal(result.details.fallbackReason, 'typesafe_timeout');
-  assert.equal(result.details.answer.value, 'safe');
-  assert.equal(result.details.answer.confidence, 0.5);
-  assert.match(result.content[0].text, /deterministic fallback/);
-
-  const boolResult = await fixture.tools.get('jev-judge').execute('call-2', {
-    checkpoint: 'delivery_preflight',
-    kind: 'bool',
-    state: 'state',
-    question: 'Ready?',
-  }, undefined, undefined, fixture.ctx);
-  assert.equal(boolResult.details.answer.value, false);
+  assert.equal(result.details.backend, 'fallback');
+  assert.equal(result.details.fallbackReason, 'typesafe_answer_invalid');
+  assert.equal(result.details.answer, undefined);
 });
 
 test('command configures enforce mode and reports disclosure', async t => {
@@ -139,7 +207,7 @@ test('empty interactive command opens graphical mode and fallback settings', asy
         },
         ({ title, options, dialog }) => {
           assert.equal(title, 'Jev Gate Fallback');
-          assert.deepEqual(options.map(option => option.label), ['continue', 'block', 'jev']);
+          assert.deepEqual(options.map(option => option.label), ['continue', 'block']);
           assert.equal(dialog.initialIndex, 0);
           return 'block';
         },
