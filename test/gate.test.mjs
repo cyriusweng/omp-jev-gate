@@ -16,13 +16,13 @@ async function setup(config, client) {
     on(name, handler) { handlers.set(name, handler); },
     appendEntry(type, data) { entries.push({ type, data }); },
   };
-  installJevGate(pi, { client, configPath });
+  const gate = installJevGate(pi, { client, configPath });
   let aborted = 0;
   const ctx = {
     sessionManager: { getSessionId: () => 'session-1' },
     abort() { aborted += 1; },
   };
-  return { directory, handlers, entries, ctx, get aborted() { return aborted; } };
+  return { directory, handlers, entries, ctx, gate, get aborted() { return aborted; } };
 }
 
 function successClient(counter = { calls: 0 }) {
@@ -106,4 +106,59 @@ test('preflight answer normalization supplies stable defaults', () => {
     verificationDepth: 'targeted',
     additionalJevProbability: 0.5,
   });
+});
+
+test('enforce blocks the first mutating tool call before judgment', async t => {
+  const fixture = await setup({ mode: 'enforce', fallback: 'continue' }, successClient());
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  await fixture.handlers.get('before_agent_start')({ prompt: 'task', systemPrompt: [] }, fixture.ctx);
+
+  const blocked = await fixture.handlers.get('tool_call')({ toolName: 'edit', toolCallId: 'e1' }, fixture.ctx);
+  assert.equal(blocked?.block, true);
+  assert.match(blocked.reason, /jev-judge/);
+
+  const readResult = await fixture.handlers.get('tool_call')({ toolName: 'read', toolCallId: 'r1' }, fixture.ctx);
+  assert.equal(readResult, undefined);
+});
+
+test('enforce unblocks mutating calls after a qualifying judgment', async t => {
+  const fixture = await setup({ mode: 'enforce', fallback: 'continue' }, successClient());
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  await fixture.handlers.get('before_agent_start')({ prompt: 'task', systemPrompt: [] }, fixture.ctx);
+
+  fixture.gate.markJudged({ backend: 'typesafe', confidence: 0.9, answer: { value: 'a' } });
+  const result = await fixture.handlers.get('tool_call')({ toolName: 'bash', toolCallId: 'b1' }, fixture.ctx);
+  assert.equal(result, undefined);
+});
+
+test('enforce unblocks mutating calls after an explicit waiver', async t => {
+  const fixture = await setup({ mode: 'enforce', fallback: 'continue' }, successClient());
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  await fixture.handlers.get('before_agent_start')({ prompt: 'please waive jev and fix the line', systemPrompt: [] }, fixture.ctx);
+
+  const result = await fixture.handlers.get('tool_call')({ toolName: 'write', toolCallId: 'w1' }, fixture.ctx);
+  assert.equal(result, undefined);
+});
+
+test('low-confidence judgments keep the gate closed', async t => {
+  const fixture = await setup({ mode: 'enforce', fallback: 'continue' }, successClient());
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  await fixture.handlers.get('before_agent_start')({ prompt: 'task', systemPrompt: [] }, fixture.ctx);
+
+  fixture.gate.markJudged({ backend: 'fallback', confidence: undefined, answer: undefined });
+  const blocked = await fixture.handlers.get('tool_call')({ toolName: 'edit', toolCallId: 'e2' }, fixture.ctx);
+  assert.equal(blocked?.block, true);
+
+  fixture.gate.markJudged({ backend: 'typesafe', confidence: 0.2, answer: { value: 'a' } });
+  const stillBlocked = await fixture.handlers.get('tool_call')({ toolName: 'edit', toolCallId: 'e3' }, fixture.ctx);
+  assert.equal(stillBlocked?.block, true);
+});
+
+test('observe mode never intercepts tool calls', async t => {
+  const fixture = await setup({ mode: 'observe', fallback: 'continue' }, successClient());
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  await fixture.handlers.get('before_agent_start')({ prompt: 'task', systemPrompt: [] }, fixture.ctx);
+
+  const result = await fixture.handlers.get('tool_call')({ toolName: 'edit', toolCallId: 'e4' }, fixture.ctx);
+  assert.equal(result, undefined);
 });

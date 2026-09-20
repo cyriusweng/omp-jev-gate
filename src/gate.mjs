@@ -2,6 +2,13 @@ import { createHash } from 'node:crypto';
 import { CONFIG_PATH, loadConfig } from './configuration.mjs';
 
 export const PREFLIGHT_STATE_TYPE = 'omp-jev-gate-preflight-v1';
+export const GATED_TOOLS = new Set(['edit', 'write', 'bash']);
+export const WAIVER_PHRASES = ['waive jev', 'skip jev', '跳过 jev'];
+
+function hasWaiver(prompt) {
+  const text = prompt.toLowerCase();
+  return WAIVER_PHRASES.some(phrase => text.includes(phrase));
+}
 
 export const PREFLIGHT_QUESTIONS = {
   decision_mode: {
@@ -85,6 +92,25 @@ export function formatPolicy(receipt) {
   ].join('\n');
 }
 
+export function fallbackSignal(question, signal) {
+  return {
+    checkpoint: question.checkpoint,
+    kind: question.kind,
+    questionDigest: digest(question.question),
+    answer: question.kind === 'bool' ? { value: false }
+      : question.kind === 'score' ? { value: 1 }
+        : { value: signal.labels[0] },
+    backend: 'deterministic-fallback',
+    fallbackReason: signal.reason,
+    recordedAt: new Date().toISOString(),
+  };
+}
+
+export function isJudged(judgment) {
+  return Boolean(judgment) && judgment.answer !== undefined &&
+    (!Number.isFinite(judgment.confidence) || judgment.confidence >= 0.5);
+}
+
 function fallbackReceipt(error) {
   return {
     backend: 'fallback',
@@ -98,9 +124,13 @@ function fallbackReceipt(error) {
 export function installJevGate(pi, { client, configPath = CONFIG_PATH } = {}) {
   if (!client) throw new Error('Jev Gate requires a TypeSafe client.');
   let prepared;
+  let turnJudged = false;
+  let turnWaived = false;
 
   function clearPreparation() {
     prepared = undefined;
+    turnJudged = false;
+    turnWaived = false;
   }
 
   async function prepare(event, ctx, config) {
@@ -145,6 +175,8 @@ export function installJevGate(pi, { client, configPath = CONFIG_PATH } = {}) {
     if (config.mode === 'off') return undefined;
 
     const prompt = event.prompt?.trim() || '[Image-only user prompt]';
+    turnWaived = hasWaiver(prompt);
+    turnJudged = false;
     const key = `${sessionId(ctx)}:${digest(prompt)}:${config.mode}:${config.fallback}`;
     if (prepared?.key !== key) prepared = { key, promise: prepare(event, ctx, config) };
 
@@ -158,10 +190,21 @@ export function installJevGate(pi, { client, configPath = CONFIG_PATH } = {}) {
     }
   });
 
+  pi.on('tool_call', async (event, ctx) => {
+    const config = await loadConfig(configPath);
+    if (config.mode !== 'enforce') return undefined;
+    if (!GATED_TOOLS.has(event.toolName)) return undefined;
+    if (turnWaived || turnJudged) return undefined;
+    return {
+      block: true,
+      reason: 'Enforce mode: call the jev-judge tool for this material choice first, then retry. A user waiver ("waive jev", "skip jev", 「跳过 jev」) in the prompt also unblocks the turn.',
+    };
+  });
+
   pi.on('agent_end', clearPreparation);
   for (const event of ['session_start', 'session_switch', 'session_tree', 'session_branch', 'session_shutdown']) {
     pi.on(event, clearPreparation);
   }
 
-  return { clearPreparation };
+  return { clearPreparation, markJudged: receipt => { turnJudged = isJudged(receipt); } };
 }

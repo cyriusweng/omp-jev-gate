@@ -30,7 +30,7 @@ async function setup(client, options = {}) {
     registerTool(tool) { tools.set(tool.name, tool); },
     registerCommand(name, command) { commands.set(name, command); },
   };
-  jevGateExtension(pi, { client, configPath });
+  jevGateExtension(pi, { client, configPath, fallback: options.fallback });
   const ctx = {
     hasUI: options.hasUI ?? false,
     sessionManager: { getSessionId: () => 'session-1' },
@@ -89,6 +89,31 @@ test('explicit judgment uses configured continue fallback', async t => {
   assert.equal(result.details.fallbackReason, 'typesafe_timeout');
 });
 
+test('jev fallback records a deterministic conservative judgment', async t => {
+  const fixture = await setup({ async judge() { throw Object.assign(new Error('offline'), { code: 'typesafe_timeout' }); } }, { fallback: 'jev' });
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const result = await fixture.tools.get('jev-judge').execute('call-1', {
+    checkpoint: 'risk',
+    kind: 'choice',
+    state: 'state',
+    question: 'Which path?',
+    labels: ['safe', 'fast'],
+  }, undefined, undefined, fixture.ctx);
+  assert.equal(result.details.backend, 'deterministic-fallback');
+  assert.equal(result.details.fallbackReason, 'typesafe_timeout');
+  assert.equal(result.details.answer.value, 'safe');
+  assert.equal(result.details.answer.confidence, 0.5);
+  assert.match(result.content[0].text, /deterministic fallback/);
+
+  const boolResult = await fixture.tools.get('jev-judge').execute('call-2', {
+    checkpoint: 'delivery_preflight',
+    kind: 'bool',
+    state: 'state',
+    question: 'Ready?',
+  }, undefined, undefined, fixture.ctx);
+  assert.equal(boolResult.details.answer.value, false);
+});
+
 test('command configures enforce mode and reports disclosure', async t => {
   const fixture = await setup({ async judge() { throw new Error('unused'); } });
   t.after(() => rm(fixture.directory, { recursive: true, force: true }));
@@ -114,7 +139,7 @@ test('empty interactive command opens graphical mode and fallback settings', asy
         },
         ({ title, options, dialog }) => {
           assert.equal(title, 'Jev Gate Fallback');
-          assert.deepEqual(options.map(option => option.label), ['continue', 'block']);
+          assert.deepEqual(options.map(option => option.label), ['continue', 'block', 'jev']);
           assert.equal(dialog.initialIndex, 0);
           return 'block';
         },

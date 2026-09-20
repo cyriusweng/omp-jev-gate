@@ -47,8 +47,10 @@ function normalizeAnswer(kind, raw, labels) {
   throw error;
 }
 
-export async function runExplicitJudgment(pi, client, params, ctx, signal, configPath = CONFIG_PATH) {
-  const config = await loadConfig(configPath);
+export async function runExplicitJudgment(pi, client, params, ctx, signal, configPath = CONFIG_PATH, fallbackOverride) {
+  const config = fallbackOverride
+    ? { ...await loadConfig(configPath), fallback: fallbackOverride }
+    : await loadConfig(configPath);
   const kind = params.kind;
   const labels = normalizedLabels(kind, params.labels);
   const state = params.state.trim().slice(0, 12_000);
@@ -68,13 +70,27 @@ export async function runExplicitJudgment(pi, client, params, ctx, signal, confi
     };
   } catch (error) {
     if (config.fallback === 'block') throw error;
-    result = {
-      backend: 'fallback',
-      model: undefined,
-      usage: undefined,
-      fallbackReason: error?.code ?? 'typesafe_request_failed',
-      answer: undefined,
-    };
+    if (config.fallback === 'jev') {
+      result = {
+        backend: 'deterministic-fallback',
+        model: undefined,
+        usage: undefined,
+        fallbackReason: error?.code ?? 'typesafe_request_failed',
+        answer: {
+          value: kind === 'bool' ? false : kind === 'score' ? 1 : labels[0],
+          confidence: 0.5,
+          probabilities: undefined,
+        },
+      };
+    } else {
+      result = {
+        backend: 'fallback',
+        model: undefined,
+        usage: undefined,
+        fallbackReason: error?.code ?? 'typesafe_request_failed',
+        answer: undefined,
+      };
+    }
   }
 
   const receipt = {
@@ -94,6 +110,9 @@ export async function runExplicitJudgment(pi, client, params, ctx, signal, confi
 }
 
 function formatJudgment(receipt) {
+  if (receipt.backend === 'deterministic-fallback') {
+    return `Jev checkpoint ${receipt.checkpoint} used deterministic fallback ${receipt.fallbackReason}; conservative answer ${String(receipt.answer?.value)} recorded. Treat it as a lower-bound judgment and preserve this receipt.`;
+  }
   if (receipt.backend === 'fallback') {
     return `Jev checkpoint ${receipt.checkpoint} used fallback ${receipt.fallbackReason}; continue with current agent reasoning and preserve this receipt.`;
   }
@@ -104,7 +123,12 @@ function formatJudgment(receipt) {
 }
 
 function formatStatus(config) {
-  return `Jev Gate mode: ${config.mode}; fallback: ${config.fallback}. Automatic preflight sends prompt text to TypeSafe in observe and enforce modes. Explicit jev-judge calls send their supplied state and question.`;
+  const fallbackDescription = config.fallback === 'jev'
+    ? 'a deterministic conservative judgment records a receipt'
+    : config.fallback === 'block'
+      ? 'the affected judgment stops'
+      : 'the current agent reasoning continues';
+  return `Jev Gate mode: ${config.mode}; fallback: ${config.fallback} (${fallbackDescription}). Automatic preflight sends prompt text to TypeSafe in observe and enforce modes; enforce mode also blocks the first edit, write or bash call each turn until a jev-judge judgment or an explicit prompt waiver. Explicit jev-judge calls send their supplied state and question.`;
 }
 
 const MODE_DESCRIPTIONS = {
@@ -116,6 +140,7 @@ const MODE_DESCRIPTIONS = {
 const FALLBACK_DESCRIPTIONS = {
   continue: 'Record a fallback receipt and continue with the current agent',
   block: 'Stop the affected judgment when TypeSafe is unavailable',
+  jev: 'Record a deterministic conservative judgment receipt when TypeSafe is unavailable',
 };
 
 async function pickSettings(ctx, current) {
@@ -141,8 +166,9 @@ async function pickSettings(ctx, current) {
 
 export default function jevGateExtension(pi, options = {}) {
   const configPath = options.configPath ?? CONFIG_PATH;
+  const fallbackOverride = options.fallback;
   const client = options.client ?? createJevClient(pi, options);
-  installJevGate(pi, { client, configPath });
+  const gate = installJevGate(pi, { client, configPath });
 
   pi.registerTool({
     name: 'jev-judge',
@@ -158,7 +184,8 @@ export default function jevGateExtension(pi, options = {}) {
       labels: pi.zod.array(pi.zod.string().min(1).max(120)).max(20).optional(),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const receipt = await runExplicitJudgment(pi, client, params, ctx, signal, configPath);
+      const receipt = await runExplicitJudgment(pi, client, params, ctx, signal, configPath, fallbackOverride);
+      gate.markJudged(receipt);
       return { content: [{ type: 'text', text: formatJudgment(receipt) }], details: receipt };
     },
   });
@@ -181,10 +208,10 @@ export default function jevGateExtension(pi, options = {}) {
           ctx.ui.notify(formatStatus(current), 'info');
           return;
         }
-        if (!MODES.has(action)) throw new Error('Use /jev-gate status|off|observe|enforce [continue|block].');
+        if (!MODES.has(action)) throw new Error('Use /jev-gate status|off|observe|enforce [continue|block|jev].');
         const fallback = tokens[1] ?? current.fallback;
         if (!FALLBACKS.has(fallback) || tokens.length > 2) {
-          throw new Error('Use fallback continue or block.');
+          throw new Error('Use fallback continue, block or jev.');
         }
         const saved = await updateConfig({ mode: action, fallback }, { path: configPath, expectedConfig: current });
         ctx.ui.notify(formatStatus(saved), 'info');

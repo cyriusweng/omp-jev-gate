@@ -7,7 +7,7 @@ const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), '.omp', 'age
 
 export const CONFIG_PATH = process.env.OMP_JEV_GATE_CONFIG || join(agentDir, 'jev-gate.json');
 export const MODES = new Set(['off', 'observe', 'enforce']);
-export const FALLBACKS = new Set(['continue', 'block']);
+export const FALLBACKS = new Set(['continue', 'block', 'jev']);
 
 export function defaultConfig() {
   return { mode: 'off', fallback: 'continue' };
