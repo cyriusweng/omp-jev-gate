@@ -66,6 +66,14 @@ Configuration is stored atomically with mode `0600` at `~/.omp/agent/jev-gate.js
 omp /login typesafe
 ```
 
+## Working with OMP Code Model
+
+[OMP Code Model](https://github.com/cyriusweng/omp-code-model) and Jev Gate form two independent judgment layers over the same OMP conversation. Code Model's Jev preflight selects the execution route and coding effort. Jev Gate's preflight supplies decision mode, reasoning depth, verification depth and later-checkpoint likelihood, then applies the current turn disposition to `edit`, `write` and `bash`. OMP serialises both `before_agent_start` hooks before the provider request and preserves system-prompt amendments, so the selected executor receives Jev Gate's global policy from its first response.
+
+`code-model start` and `code-model finish` control the executor phase while Jev Gate controls guarded work. A pending Jev Gate turn can enter the coding model, and the first guarded call remains blocked until `direct_continue`, a completed `jev-judge` checkpoint or an allowed degraded disposition unlocks it. The disposition belongs to the task turn and remains valid across the coding-model hand-off. Agent completion and session navigation clear it, so the main-model review receives a fresh preflight when OMP starts a new agent turn.
+
+Each plugin records its own receipt and normally issues its own focused TypeSafe request. Their fallback settings compose. With Code Model routing set to `enforce main_agent` and Jev Gate set to `enforce continue`, a TypeSafe routing failure keeps or restores the main executor, while a Jev Gate failure records `degraded_continue` and permits guarded work under the agent's recorded reasoning. `enforce block` gives Jev Gate fail-closed availability for the affected turn.
+
 ## Explicit judgment
 
 `jev-judge` accepts `checkpoint`, `kind`, `state`, `question` and optional `labels`. Its receipts are the formal semantic-judgment records of the gate; preflight supplies only entry signals and turn dispositions such as `direct_continue` and `degraded_continue`. Checkpoints are domain-neutral: `problem_framing`, `approach_selection`, `candidate_filtering`, `evidence_sufficiency`, `risk`, `verification_scope`, `delivery_readiness` and `other`. The earlier coding-oriented names `architecture`, `implementation_path`, `test_coverage` and `delivery_preflight` remain valid for continuity with existing receipts. Choice supports 2–20 distinct labels. Score supports 2–10 ordered levels. Boolean questions use `kind: "bool"`, which the client encodes using TypeSafe's native `noul` probability type. The client validates answer type, required fields, finite in-range probabilities, allowed choice labels and in-range scores following OMP's built-in TypeSafeJudge contract before accepting a receipt.
