@@ -2,6 +2,17 @@
 
 OMP Jev Gate is a standalone OMP plugin that gives TypeSafe Jev a defined role in local conversation judgments. It runs an optional typed preflight before each user prompt and provides an essential `jev-judge` tool for bounded decisions during a turn. It works through the public extension API and keeps OMP source unchanged.
 
+> [!IMPORTANT]
+> **Jev Gate adds an independent, typed judgment layer to OMP.** It gives the agent a compact second opinion before material choices and records the result as an auditable session receipt.
+
+## Why use it
+
+Agent work often turns on a few consequential choices: selecting an architecture, filtering candidates, deciding whether evidence is sufficient, choosing test coverage or checking delivery readiness. Jev Gate sends the relevant state and a bounded choice, score or boolean question to TypeSafe Jev, then returns probabilities and confidence in a stable schema. This makes the checkpoint explicit, reviewable and reusable by the current agent.
+
+The plugin supports two complementary levels. Automatic preflight evaluates each user prompt and supplies decision mode, reasoning depth and verification guidance. The `jev-judge` tool handles focused checkpoints during a turn, after the agent has gathered the evidence that matters. `observe` mode records guidance, `enforce` mode applies it to the agent instructions, and deterministic fallback policy defines how work proceeds when the service is unavailable.
+
+This design is useful for teams that want consistent judgment policy, visible decision provenance and a controlled place for an independent model opinion while keeping the extension installable as a standalone OMP plugin.
+
 ## Judgment contract
 
 The preflight asks Jev for four independent signals: decision mode, reasoning depth, verification depth and the value of additional Jev checkpoints. Enforce mode appends these signals to the system prompt and directs the agent to call `jev-judge` before material bounded choices in architecture, implementation path, candidate filtering, risk, test coverage and delivery preflight. Observe mode records the same preflight receipt while preserving the current system prompt. Off mode skips automatic preflight; the explicit tool remains available.
@@ -24,9 +35,10 @@ Local development can use a link:
 omp plugin link /path/to/omp-jev-gate
 ```
 
-The plugin starts in `off` mode. Configure it from an idle OMP conversation:
+The plugin starts in `off` mode. Run `/jev-gate` in an interactive OMP conversation to open the graphical mode and fallback selectors. The command form remains available for scripts:
 
 ```text
+/jev-gate
 /jev-gate status
 /jev-gate observe continue
 /jev-gate enforce continue
