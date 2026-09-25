@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { CONFIG_PATH, FALLBACKS, MODES, loadConfig, updateConfig } from './configuration.mjs';
 import { digest, installJevGate } from './gate.mjs';
 import { createJevClient, validateAnswer } from './jev-client.mjs';
@@ -49,6 +50,11 @@ function normalizeAnswer(kind, raw, labels) {
 }
 
 export async function runExplicitJudgment(pi, client, params, ctx, signal, configPath = CONFIG_PATH) {
+  const started = performance.now();
+  const startedAt = new Date().toISOString();
+  const judgmentId = randomUUID();
+  let traceId = judgmentId;
+  pi.events?.emit('cyrius:chain-trace:v1', { ctx, accept(id) { traceId = id; } });
   const originatingSessionId = sessionId(ctx);
   const config = await loadConfig(configPath);
   signal?.throwIfAborted();
@@ -89,6 +95,7 @@ export async function runExplicitJudgment(pi, client, params, ctx, signal, confi
     version: 1,
     sessionId: originatingSessionId,
     recordedAt: new Date().toISOString(),
+    traceId, judgmentId, startedAt, durationMs: Math.round(performance.now() - started),
     checkpoint: params.checkpoint,
     kind,
     stateDigest: digest(state),
@@ -97,7 +104,7 @@ export async function runExplicitJudgment(pi, client, params, ctx, signal, confi
     fallback: config.fallback,
     ...result,
   };
-  pi.appendEntry(JUDGMENT_STATE_TYPE, receipt);
+  if (sessionId(ctx) === originatingSessionId) pi.appendEntry(JUDGMENT_STATE_TYPE, receipt);
   if (failure && (config.fallback === 'block' || signal?.aborted)) throw failure;
   return receipt;
 }

@@ -185,10 +185,12 @@ test('an asynchronous judgment retains its originating session identity', async 
   f.switchSession('session-next');
   await f.emit('session_switch');
   await f.start();
+  const entryCount = f.entries.length;
   release();
   const result = await pending;
   assert.equal(result.details.sessionId, 'session-chain');
   assert.equal((await f.tool()).block, true);
+  assert.equal(f.entries.length, entryCount);
 });
 
 test('cancellation remains cancellation under continue fallback', async t => {

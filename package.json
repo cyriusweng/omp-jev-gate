@@ -1,6 +1,6 @@
 {
   "name": "@cyriusweng/omp-jev-gate",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "TypeSafe Jev preflight and typed judgment checkpoints for OMP conversations",
   "type": "module",
   "license": "MIT",

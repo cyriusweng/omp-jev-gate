@@ -74,7 +74,7 @@ function encodeQuestions(questions) {
  return Object.fromEntries(Object.entries(questions).map(([id, question]) => [id, encodeQuestion(question)]));
 }
 
-function decodeAnswers(questions, answers) {
+export function decodeAnswers(questions, answers) {
  return Object.fromEntries(Object.entries(questions).map(([id, question]) => {
   const raw = answers[id];
   if (question.type === 'bool') {
@@ -116,10 +116,11 @@ export function createJevClient(pi, options = {}) {
   return { key: undefined, source: 'absent' };
  }
 
- async function judge(state, questions, signal) {
+ async function request(state, questions, signal) {
   signal?.throwIfAborted();
   const encodedQuestions = encodeQuestions(questions);
   const auth = await credential(signal);
+  signal?.throwIfAborted();
   if (!auth.key) {
    const error = new Error('TypeSafe credential is unavailable.');
    error.code = 'typesafe_credential_unavailable';
@@ -165,11 +166,16 @@ export function createJevClient(pi, options = {}) {
   return {
    backend: 'typesafe',
    model: typeof payload.model === 'string' ? payload.model : 'jev-latest',
-   answers: decodeAnswers(questions, payload.answers),
+   answers: payload.answers,
    usage: safeUsage(payload.usage),
    credentialSource: auth.source,
   };
  }
 
- return { judge };
+ async function judge(state, questions, signal) {
+  const response = await request(state, questions, signal);
+  return { ...response, answers: decodeAnswers(questions, response.answers) };
+ }
+
+ return { judge, request };
 }

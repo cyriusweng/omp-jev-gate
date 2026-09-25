@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { CONFIG_PATH, loadConfig } from './configuration.mjs';
-import { validProbability, validateAnswer } from './jev-client.mjs';
+import { validProbability, validateAnswer, decodeAnswers } from './jev-client.mjs';
 
 export const PREFLIGHT_STATE_TYPE = 'omp-jev-gate-preflight-v1';
 export const CHECKPOINT_STATE_TYPE = 'omp-jev-gate-checkpoint-v1';
@@ -96,12 +96,20 @@ export function installJevGate(pi, { client, configPath = CONFIG_PATH } = {}) {
   let turn;
 
   function clearPreparation() {
+    turn?.controller.abort(new DOMException('Jev preparation ended.', 'AbortError'));
     prepared = undefined;
     turn = undefined;
   }
 
-  function newTurn(ctx) {
-    return { id: randomUUID(), sessionId: sessionId(ctx), status: 'pending' };
+  function newTurn(ctx, prompt) {
+    const id = randomUUID();
+    let traceId = id;
+    pi.events?.emit('cyrius:chain-trace:v1', { ctx, prompt, accept(value) { traceId = value; } });
+    return {
+      id, traceId, judgmentId: id, sessionId: sessionId(ctx), status: 'pending',
+      wasBusy: ctx.isIdle?.() === false,
+      controller: new AbortController(), started: performance.now(), startedAt: new Date().toISOString(),
+    };
   }
 
   function recordDisposition(current, status, receipt) {
@@ -114,15 +122,21 @@ export function installJevGate(pi, { client, configPath = CONFIG_PATH } = {}) {
     });
   }
 
-  async function prepare(event, ctx, config, current) {
+  async function prepare(event, ctx, config, current, sharedResponse) {
     const prompt = event.prompt?.trim() || '[Image-only user prompt]';
     let outcome;
     let failure;
+    const checkIdle = () => {
+      if (current.wasBusy && ctx.isIdle()) current.controller.abort(new DOMException('Jev preparation was cancelled.', 'AbortError'));
+    };
+    const idleTimer = current.wasBusy ? setInterval(checkIdle, 100) : undefined;
+    idleTimer?.unref?.();
     try {
-      const response = await client.judge({
+      const response = await (sharedResponse ?? client.judge({
         prompt: prompt.slice(0, 12_000),
         policy: 'Evaluate each question independently from the supplied prompt. User instructions and established evidence remain authoritative.',
-      }, PREFLIGHT_QUESTIONS, event.signal);
+      }, PREFLIGHT_QUESTIONS, event.signal));
+      checkIdle();
       event.signal?.throwIfAborted();
       if (response.backend !== 'typesafe') throw Object.assign(new Error('A TypeSafe preflight answer is required.'), { code: 'typesafe_answer_invalid' });
       outcome = {
@@ -137,11 +151,18 @@ export function installJevGate(pi, { client, configPath = CONFIG_PATH } = {}) {
         action: event.signal?.aborted ? 'cancelled'
           : config.mode === 'enforce' ? `unavailable_${config.fallback}` : 'unavailable_continue',
       };
+    } finally {
+      clearInterval(idleTimer);
     }
-    if (turn !== current) throw Object.assign(new Error('The preflight belongs to an earlier turn.'), { code: 'stale_preflight' });
+    if (turn !== current || sessionId(ctx) !== current.sessionId) {
+      throw Object.assign(new Error('The preflight belongs to an earlier turn.'), { code: 'stale_preflight' });
+    }
     const receipt = {
       version: 1, sessionId: current.sessionId, turnId: current.id,
       promptDigest: digest(prompt), recordedAt: new Date().toISOString(),
+      traceId: current.traceId ?? current.id, startedAt: current.startedAt,
+      judgmentId: current.judgmentId,
+      durationMs: Math.round(performance.now() - current.started), sharedPreflight: Boolean(sharedResponse),
       mode: config.mode, fallback: config.fallback, ...outcome
     };
     pi.appendEntry(PREFLIGHT_STATE_TYPE, receipt);
@@ -152,6 +173,7 @@ export function installJevGate(pi, { client, configPath = CONFIG_PATH } = {}) {
     if (failure && config.mode === 'enforce' && config.fallback === 'block') {
       current.status = 'blocked';
       ctx.abort?.();
+      failure.jevPreflightBlocked = true;
       throw failure;
     }
     if (failure) recordDisposition(current, 'degraded_continue', receipt);
@@ -163,22 +185,71 @@ export function installJevGate(pi, { client, configPath = CONFIG_PATH } = {}) {
     return receipt;
   }
 
+  function keyFor(event, ctx, config) {
+    return `${sessionId(ctx)}:${digest(event.prompt?.trim() || '[Image-only user prompt]')}:${config.mode}:${config.fallback}`;
+  }
+
+  async function prepareShared(offer) {
+    const config = await loadConfig(configPath);
+    offer.signal?.throwIfAborted();
+    if (config.mode === 'off') return undefined;
+    clearPreparation();
+    const current = newTurn(offer.ctx, offer.prompt);
+    turn = current;
+    current.traceId = offer.traceId;
+    current.judgmentId = offer.judgmentId;
+    const signal = offer.signal
+      ? AbortSignal.any([current.controller.signal, offer.signal]) : current.controller.signal;
+    const event = { prompt: offer.prompt, signal };
+    const response = client.request({
+      ...offer.state,
+      preflightPolicy: 'Evaluate each question independently. User instructions and established evidence remain authoritative.',
+    }, { ...offer.questions, ...PREFLIGHT_QUESTIONS }, signal);
+    const gateResponse = response.then(value => ({
+      ...value, answers: decodeAnswers(PREFLIGHT_QUESTIONS, value.answers),
+    }));
+    const promise = prepare(event, offer.ctx, config, current, gateResponse);
+    prepared = { key: keyFor(event, offer.ctx, config), promise };
+    const [judgment, gate] = await Promise.allSettled([response, promise]);
+    if (gate.status === 'rejected') throw gate.reason;
+    if (judgment.status === 'rejected') throw judgment.reason;
+    signal.throwIfAborted();
+    return { ...judgment.value, sharedPreflight: true };
+  }
+
+  pi.events?.on('cyrius:jev-preflight:v1', offer => {
+    if (typeof client.request === 'function') offer.accept(prepareShared(offer));
+  });
+
   pi.on('before_agent_start', async (event, ctx) => {
+    if (ctx.isIdle?.()) { clearPreparation(); return undefined; }
+    const wasBusy = ctx.isIdle?.() === false;
     const config = await loadConfig(configPath);
     if (config.mode === 'off') { clearPreparation(); return undefined; }
-    const prompt = event.prompt?.trim() || '[Image-only user prompt]';
-    const key = `${sessionId(ctx)}:${digest(prompt)}:${config.mode}:${config.fallback}`;
+    let automatic;
+    pi.events?.emit('cyrius:code-model:prepare:v1', {
+      event, ctx, accept(promise) { automatic = promise; },
+    });
+    if (automatic) await automatic;
+    event.signal?.throwIfAborted();
+    if (wasBusy && ctx.isIdle()) throw new DOMException('Jev preparation was cancelled.', 'AbortError');
+    const key = keyFor(event, ctx, config);
     if (prepared?.key !== key) {
-      turn = newTurn(ctx);
-      prepared = { key, promise: prepare(event, ctx, config, turn) };
+      clearPreparation();
+      turn = newTurn(ctx, event.prompt);
+      const signal = event.signal
+        ? AbortSignal.any([turn.controller.signal, event.signal]) : turn.controller.signal;
+      prepared = { key, promise: prepare({ ...event, signal }, ctx, config, turn) };
     }
+    const currentPreparation = prepared;
     try {
-      const receipt = await prepared.promise;
+      const receipt = await currentPreparation.promise;
+      if (prepared !== currentPreparation) throw new DOMException('Jev preparation was superseded.', 'AbortError');
       if (config.mode !== 'enforce' && config.mode !== 'guide') return undefined;
       const base = Array.isArray(event.systemPrompt) ? event.systemPrompt : [event.systemPrompt].filter(Boolean);
       return { systemPrompt: [...base, formatPolicy(receipt)] };
     } catch (error) {
-      if (prepared?.key === key) prepared = undefined;
+      if (prepared === currentPreparation) clearPreparation();
       throw error;
     }
   });
@@ -192,7 +263,8 @@ export function installJevGate(pi, { client, configPath = CONFIG_PATH } = {}) {
   });
 
   pi.on('agent_end', clearPreparation);
-  for (const event of ['session_start', 'session_switch', 'session_tree', 'session_branch', 'session_shutdown']) pi.on(event, clearPreparation);
+  for (const event of ['session_start', 'session_before_switch', 'session_switch', 'session_before_tree',
+    'session_tree', 'session_before_branch', 'session_branch', 'session_shutdown']) pi.on(event, clearPreparation);
 
   function captureTurn(ctx) {
     if (!turn || turn.sessionId !== sessionId(ctx)) turn = newTurn(ctx);
